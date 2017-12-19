@@ -26,7 +26,7 @@ import org.apache.hadoop.io.compress.zlib.*;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY;
-import org.apache.hadoop.io.compress.connex.GzipConnexCompressor;
+import org.apache.hadoop.io.compress.accelerated.GzipFpgaCompressor;
 
 /**
  * This class creates gzip compressors/decompressors.
@@ -123,14 +123,14 @@ public class GzipCodec extends DefaultCodec {
 
     @Override
     public Compressor createCompressor() {
-        return GzipConnexCompressor.connexCoreAvailable() ? new GzipConnexCompressor(
-                GzipConnexCompressor.CompressionType.FIXED_HUFFMAN) : ZlibFactory.isNativeZlibLoaded(conf) ?
+        return GzipFpgaCompressor.gzipCoreAvailable() ? new GzipFpgaCompressor(
+                GzipFpgaCompressor.CompressionType.FIXED_HUFFMAN) : ZlibFactory.isNativeZlibLoaded(conf) ?
                 new GzipZlibCompressor(conf) : null;
     }
 
     @Override
     public Class<? extends Compressor> getCompressorType() {
-        return GzipConnexCompressor.connexCoreAvailable() ? GzipConnexCompressor.class : ZlibFactory.isNativeZlibLoaded(
+        return GzipFpgaCompressor.gzipCoreAvailable() ? GzipFpgaCompressor.class : ZlibFactory.isNativeZlibLoaded(
                 conf) ? GzipZlibCompressor.class : null;
     }
 
