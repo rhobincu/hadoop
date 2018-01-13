@@ -13,17 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.hadoop.io.compress.accelerated;
+package org.apache.hadoop.io.compress.gzipFpga;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.RandomAccessFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.hadoop.conf.Configuration;
@@ -36,10 +34,9 @@ import org.apache.hadoop.io.compress.Compressor;
 public class GzipFpgaCompressor implements Compressor {
 
     private static final int DEVICE_ID = 0xBC;
+    private static final int MAX_BLOCK_SIZE = 65535;
 
     private static final Logger LOGGER = Logger.getLogger(GzipFpgaCompressor.class.getName());
-
-    private static final int RESET_COMMAND = 0x00;
 
     public static boolean gzipCoreAvailable() {
         try {
@@ -48,11 +45,13 @@ public class GzipFpgaCompressor implements Compressor {
             File registerFiles = new File("/dev/xillybus_mem_8");
             if (writePipe.exists() && readPipe.exists() && registerFiles.exists()) {
                 LOGGER.log(Level.INFO, "Xillibus files exist! Checking for DEVICE_ID...");
-                RandomAccessFile registerReader = new RandomAccessFile(registerFiles, "r");
-                registerReader.seek(Address.DEV_ID.get());
-                int devId = registerReader.read();
-                LOGGER.log(Level.INFO, "Device ID read: {0}", devId);
-                return devId >= DEVICE_ID;
+                int devId;
+                try (RegisterFile registerFile = new RegisterFile(registerFiles.getAbsolutePath())) {
+                    devId = registerFile.getDeviceId();
+                    LOGGER.log(Level.INFO, "Device ID read: {0}", devId);
+                    return devId >= DEVICE_ID;
+                }
+
             }
             LOGGER.log(Level.INFO, "File device does not exist => No GZIP core.");
             return false;
@@ -66,77 +65,51 @@ public class GzipFpgaCompressor implements Compressor {
         (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x0, (byte) 0x00};
 
     private static byte[] toBytes(int byteCountToWrite) {
+        LOGGER.log(Level.INFO, "ByteCount: {0}", String.format("0x%08x", byteCountToWrite));
         byte[] buffer = new byte[4];
-        buffer[0] = (byte) byteCountToWrite;
-        buffer[1] = (byte) (byteCountToWrite >>> 8);
-        buffer[2] = (byte) (byteCountToWrite >>> 16);
-        buffer[3] = (byte) (byteCountToWrite >>> 24);
+        buffer[3] = (byte) byteCountToWrite;
+        buffer[2] = (byte) (byteCountToWrite >>> 8);
+        buffer[1] = (byte) (byteCountToWrite >>> 16);
+        buffer[0] = (byte) (byteCountToWrite >>> 24);
         return buffer;
     }
-
-    private static enum Address {
-        RESET(0x0000000),
-        BTYPE(0x00000001),
-        STATUS(0x00000002),
-        ISIZE_1(0x00000003),
-        ISIZE_2(0x00000004),
-        ISIZE_3(0x00000005),
-        ISIZE_4(0x00000006),
-        CRC_1(0x00000007),
-        CRC_2(0x00000008),
-        CRC_3(0x00000009),
-        CRC_4(0x000000010),
-        DEV_ID(0x0000000E);
-        private final int mAddress;
-
-        private Address(int address) {
-            mAddress = address;
-        }
-
-        public int get() {
-            return mAddress;
-        }
-    }
-
-    public static enum CompressionType {
-        NO_COMPRESSION(0x00),
-        FIXED_HUFFMAN(0x01),
-        DYNAMIC_HUFFMAN(0x02);
-        private final int mType;
-
-        private CompressionType(int type) {
-            mType = type;
-        }
-
-        public int getIntType() {
-            return mType;
-        }
-    }
+    private RegisterFile.CompressionType mCompressionType;
 
     private static class CompressionThread extends Thread {
 
         private final InputStream mStream;
         private final OutputStream mOutStream;
         private IOException mException;
+        private final RegisterFile mRegisterFile;
+        private volatile boolean mCompressionComplete;
 
-        public CompressionThread(InputStream inStream, OutputStream outStream) {
+        public CompressionThread(InputStream inStream, OutputStream outStream,
+                RegisterFile registerFile) {
             super("FPGA GZip Compression Thread");
             mStream = inStream;
             mOutStream = outStream;
+            mRegisterFile = registerFile;
+            mCompressionComplete = false;
         }
 
         @Override
         public void run() {
-            byte[] buffer = new byte[1024];
+            byte[] buffer = new byte[1024 * 64];
             int bytesRead;
             try {
                 while (!isInterrupted()) {
                     bytesRead = mStream.read(buffer);
+
+                    LOGGER.log(Level.INFO, "Thread read {0} bytes.", bytesRead);
+                    LOGGER.log(Level.INFO, "Compression complete: {0}: ", mRegisterFile.isCompressionComplete());
+                    LOGGER.log(Level.INFO, "Isize: {0}: ", String.format("0x%08x", mRegisterFile.getInputSize()));
                     if (bytesRead > 0) {
+
                         synchronized (mOutStream) {
                             mOutStream.write(buffer, 0, bytesRead);
                         }
                     }
+                    mCompressionComplete = mRegisterFile.isCompressionComplete();
                 }
             } catch (IOException ex) {
                 LOGGER.log(Level.SEVERE, "IOException while reading compressed data: ", ex);
@@ -151,33 +124,37 @@ public class GzipFpgaCompressor implements Compressor {
         public boolean hasThrownException() {
             return mException != null;
         }
+
+        public boolean isComplete() {
+            return mCompressionComplete;
+        }
     }
 
     private final FileOutputStream mXilibusOutputStream;
     private final FileInputStream mXilibusInputStream;
-    private final RandomAccessFile mRegisterSet;
-    private final CompressionType mCompressionType;
+    private final RegisterFile mRegisterFile;
 
     private final ByteArrayOutputStream mInputBuffer;
     private final ByteArrayOutputStream mOutputBuffer;
 
-    private boolean mCompressionComplete;
     private int mTotalBytesReceived;
     private int mTotalBytesCompressed;
 
     private IOException mException;
     private CompressionThread mCompressionThread;
 
-    public GzipFpgaCompressor(CompressionType compressionType) {
+    public GzipFpgaCompressor(RegisterFile.CompressionType compressionType) {
         try {
             mCompressionType = compressionType;
             mXilibusOutputStream = new FileOutputStream("/dev/xillybus_write_32");
             mXilibusInputStream = new FileInputStream("/dev/xillybus_read_32");
-            mRegisterSet = new RandomAccessFile("/dev/xillybus_mem_8", "rwd");
+            mRegisterFile = new RegisterFile("/dev/xillybus_mem_8");
             mOutputBuffer = new ByteArrayOutputStream();
             mInputBuffer = new ByteArrayOutputStream(65536);
+            mCompressionThread = new CompressionThread(mXilibusInputStream, mOutputBuffer, mRegisterFile);
+            mCompressionThread.start();
             reset();
-        } catch (FileNotFoundException ex) {
+        } catch (IOException ex) {
             Logger.getLogger(GzipFpgaCompressor.class.getName()).log(Level.SEVERE, null, ex);
             throw new RuntimeException("Unable to open pipes", ex);
         }
@@ -190,16 +167,19 @@ public class GzipFpgaCompressor implements Compressor {
             mTotalBytesReceived += len;
 
             while (len != 0) {
-                if (mInputBuffer.size() + len <= 65535) {
+                if (mInputBuffer.size() + len <= MAX_BLOCK_SIZE) {
                     mInputBuffer.write(b, off, len);
                     return;
                 }
 
-                mInputBuffer.write(b, off, 65535 - mInputBuffer.size());
+                int chunkSize = MAX_BLOCK_SIZE - mInputBuffer.size();
+                
+                mInputBuffer.write(b, off, chunkSize);
                 mXilibusOutputStream.write(toBytes(mInputBuffer.size()));
                 mXilibusOutputStream.write(mInputBuffer.toByteArray(), 0, mInputBuffer.size());
-                len -= 65535 - mInputBuffer.size();
-                off += 65535 - mInputBuffer.size();
+                mXilibusOutputStream.flush();
+                len -= chunkSize;
+                off += chunkSize;
                 mInputBuffer.reset();
             }
 
@@ -232,10 +212,15 @@ public class GzipFpgaCompressor implements Compressor {
     @Override
     public synchronized void finish() {
         try {
-            mXilibusOutputStream.write(toBytes(mInputBuffer.size() | 0x01000000));
+            final byte[] header = toBytes(mInputBuffer.size() | 0x01000000);
+            mXilibusOutputStream.write(header);
             mXilibusOutputStream.write(mInputBuffer.toByteArray(), 0, mInputBuffer.size());
+            mXilibusOutputStream.flush();
+
+            LOGGER.log(Level.INFO, "ISize is: {0}", mRegisterFile.getInputSize());
+            LOGGER.log(Level.INFO, "Status is: {0}", mRegisterFile.getStatus());
+
             mInputBuffer.reset();
-            mCompressionComplete = true;
         } catch (IOException ex) {
             LOGGER.log(Level.SEVERE, "Unable to write data to FPGA compressor: ", ex);
             mException = ex;
@@ -244,7 +229,7 @@ public class GzipFpgaCompressor implements Compressor {
 
     @Override
     public boolean finished() {
-        return mCompressionComplete && mOutputBuffer.size() == 0;
+        return mCompressionThread.isComplete();
     }
 
     @Override
@@ -277,21 +262,19 @@ public class GzipFpgaCompressor implements Compressor {
     @Override
     public void reset() {
         try {
-            mRegisterSet.seek(Address.RESET.get());
-            mRegisterSet.write(RESET_COMMAND);
+            mRegisterFile.reset();
+            mRegisterFile.setCompressionType(mCompressionType);
 
-            mRegisterSet.seek(Address.BTYPE.get());
-            mRegisterSet.write(mCompressionType.getIntType());
+            LOGGER.log(Level.INFO, "BType value after reset is: {0}", mRegisterFile.getCompressionType());
 
             mInputBuffer.reset();
             mOutputBuffer.reset();
             mOutputBuffer.write(HEADER, 0, HEADER.length);
 
-            mCompressionComplete = false;
             mTotalBytesReceived = 0;
             mTotalBytesCompressed = 0;
         } catch (IOException ex) {
-            LOGGER.log(Level.SEVERE, "Unable to reset core.", ex);
+            LOGGER.log(Level.SEVERE, "Unable to reset FPGA: ", ex);
             mException = ex;
         }
     }
@@ -299,17 +282,15 @@ public class GzipFpgaCompressor implements Compressor {
     @Override
     public void end() {
         try {
-            mCompressionThread.interrupt();
-            mCompressionThread.join();
-            mXilibusInputStream.close();
             mXilibusOutputStream.close();
-            mRegisterSet.close();
+            mXilibusInputStream.close();
+            mRegisterFile.close();
+
+            mCompressionThread.stop();
 
         } catch (IOException ex) {
             LOGGER.log(Level.SEVERE, "Unable to close streams.", ex);
             mException = ex;
-        } catch (InterruptedException ex) {
-            LOGGER.log(Level.WARNING, "Thread interrupted while waiting for compression thread to end.", ex);
         }
     }
 

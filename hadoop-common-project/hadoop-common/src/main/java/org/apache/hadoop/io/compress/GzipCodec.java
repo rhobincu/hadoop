@@ -26,7 +26,8 @@ import org.apache.hadoop.io.compress.zlib.*;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY;
-import org.apache.hadoop.io.compress.accelerated.GzipFpgaCompressor;
+import org.apache.hadoop.io.compress.gzipFpga.GzipFpgaCompressor;
+import org.apache.hadoop.io.compress.gzipFpga.RegisterFile;
 
 /**
  * This class creates gzip compressors/decompressors.
@@ -36,8 +37,8 @@ import org.apache.hadoop.io.compress.accelerated.GzipFpgaCompressor;
 public class GzipCodec extends DefaultCodec {
 
     /**
-     * A bridge that wraps around a DeflaterOutputStream to make it
-     * a CompressionOutputStream.
+     * A bridge that wraps around a DeflaterOutputStream to make it a
+     * CompressionOutputStream.
      */
     @InterfaceStability.Evolving
     protected static class GzipOutputStream extends CompressorStream {
@@ -114,18 +115,18 @@ public class GzipCodec extends DefaultCodec {
     public CompressionOutputStream createOutputStream(OutputStream out,
             Compressor compressor)
             throws IOException {
-        return (compressor != null) ?
-                new CompressorStream(out, compressor,
+        return (compressor != null)
+                ? new CompressorStream(out, compressor,
                         conf.getInt(IO_FILE_BUFFER_SIZE_KEY,
-                                IO_FILE_BUFFER_SIZE_DEFAULT)) :
-                createOutputStream(out);
+                                IO_FILE_BUFFER_SIZE_DEFAULT))
+                : createOutputStream(out);
     }
 
     @Override
     public Compressor createCompressor() {
         return GzipFpgaCompressor.gzipCoreAvailable() ? new GzipFpgaCompressor(
-                GzipFpgaCompressor.CompressionType.FIXED_HUFFMAN) : ZlibFactory.isNativeZlibLoaded(conf) ?
-                new GzipZlibCompressor(conf) : null;
+                RegisterFile.CompressionType.FIXED_HUFFMAN) : ZlibFactory.isNativeZlibLoaded(conf)
+                ? new GzipZlibCompressor(conf) : null;
     }
 
     @Override
@@ -155,22 +156,22 @@ public class GzipCodec extends DefaultCodec {
 
     @Override
     public Decompressor createDecompressor() {
-        return (ZlibFactory.isNativeZlibLoaded(conf)) ?
-                new GzipZlibDecompressor() :
-                new BuiltInGzipDecompressor();
+        return (ZlibFactory.isNativeZlibLoaded(conf))
+                ? new GzipZlibDecompressor()
+                : new BuiltInGzipDecompressor();
     }
 
     @Override
     public Class<? extends Decompressor> getDecompressorType() {
-        return ZlibFactory.isNativeZlibLoaded(conf) ?
-                GzipZlibDecompressor.class :
-                BuiltInGzipDecompressor.class;
+        return ZlibFactory.isNativeZlibLoaded(conf)
+                ? GzipZlibDecompressor.class
+                : BuiltInGzipDecompressor.class;
     }
 
     @Override
     public DirectDecompressor createDirectDecompressor() {
-        return ZlibFactory.isNativeZlibLoaded(conf) ?
-                new ZlibDecompressor.ZlibDirectDecompressor(
+        return ZlibFactory.isNativeZlibLoaded(conf)
+                ? new ZlibDecompressor.ZlibDirectDecompressor(
                         ZlibDecompressor.CompressionHeader.AUTODETECT_GZIP_ZLIB, 0) : null;
     }
 
